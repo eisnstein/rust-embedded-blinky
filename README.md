@@ -1,2 +1,1 @@
-# rust-embedded
-TBD
+# Rust Embedded Blinky
