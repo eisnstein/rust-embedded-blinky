@@ -5,13 +5,13 @@ extern crate panic_halt;
 
 use core::{cell::RefCell, ops::Deref};
 
-use cortex_m::{interrupt::Mutex, peripheral::syst::SystClkSource};
-use cortex_m_rt::{entry, exception};
+use cortex_m::interrupt::Mutex;
+use cortex_m::peripheral::NVIC;
+use cortex_m_rt::entry;
 use cortex_m_semihosting::{self, hprintln};
-use stm32f3::stm32f303::{self, GPIOE, SYST};
+use stm32f3::stm32f303::{self, interrupt, EXTI, GPIOE};
 
-const HSI_CLOCK: u32 = 8_000_000;
-
+static EXT_I: Mutex<RefCell<Option<EXTI>>> = Mutex::new(RefCell::new(None));
 static GPIO_E: Mutex<RefCell<Option<GPIOE>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
@@ -20,43 +20,60 @@ fn main() -> ! {
     hprintln!("Hello from Discovery");
 
     let peripherals = stm32f303::Peripherals::take().unwrap();
-    let mut systick = stm32f303::CorePeripherals::take().unwrap().SYST;
 
-    init_systick(&mut systick, 1_000);
+    let syscfg = &peripherals.SYSCFG;
+    let exti = &peripherals.EXTI;
+
+    // Initialize EXT interrupt
+
+    // Set Pin 0 from Port A as input for EXTI0
+    syscfg.exticr1.write(|w| w.exti0().pa0());
+    // Disable mask on EXTI0
+    exti.imr1.write(|w| w.mr0().set_bit());
+    // Set rising trigger disabled
+    exti.rtsr1.write(|w| w.tr0().disabled());
+    // Set falling trigger enabled
+    exti.ftsr1.write(|w| w.tr0().enabled());
+    // Enable interrupt
+    unsafe {
+        NVIC::unmask(stm32f303::Interrupt::EXTI0);
+    }
 
     let rcc = &peripherals.RCC;
     // Set HSI clock on
     rcc.cr.write(|w| w.hsion().set_bit());
-    // Enable GPIO Port E clock
+    // Enable GPIO Port E and A clock
+    rcc.ahbenr.write(|w| w.iopaen().enabled());
     rcc.ahbenr.write(|w| w.iopeen().enabled());
     // Enable SYSCFG clock
     rcc.apb2enr.write(|w| w.syscfgen().enabled());
 
-    let gpioe = peripherals.GPIOE;
+    let gpioa = &peripherals.GPIOA;
+    // Set Pin 0 to input
+    gpioa.moder.write(|w| w.moder0().input());
+
+    let gpioe = &peripherals.GPIOE;
     // Set Pin 9 to output
     gpioe.moder.write(|w| w.moder9().output());
 
-    // Put gpioe into the global variable to be able to
-    // access Port E in the SysTick interrupt handler.
-    cortex_m::interrupt::free(|cs| GPIO_E.borrow(cs).replace(Some(gpioe)));
+    // Put exti and gpioe into the global variable to be able to
+    // access Port E in the EXTI0 interrupt handler.
+    cortex_m::interrupt::free(|cs| {
+        EXT_I.borrow(cs).replace(Some(peripherals.EXTI));
+        GPIO_E.borrow(cs).replace(Some(peripherals.GPIOE));
+    });
 
     loop {}
 }
 
-fn init_systick(systick: &mut SYST, ms: u32) {
-    let seconds = (ms / 1_000) as f32;
-    let count_val = (HSI_CLOCK as f32 * seconds) as u32 - 1;
-
-    systick.set_clock_source(SystClkSource::Core);
-    systick.set_reload(count_val);
-    systick.clear_current();
-    systick.enable_counter();
-    systick.enable_interrupt();
-}
-
-#[exception]
-fn SysTick() {
+#[interrupt]
+fn EXTI0() {
     cortex_m::interrupt::free(|cs| {
+        if let Some(exti) = EXT_I.borrow(cs).borrow().deref() {
+            // Clear pending register
+            exti.pr1.write(|w| w.pr0().set_bit());
+        }
+
         if let Some(gpioe) = GPIO_E.borrow(cs).borrow().deref() {
             // Read Port E Pin 9 output data register
             if gpioe.odr.read().odr9().bit_is_set() {
